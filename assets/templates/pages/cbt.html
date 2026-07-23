@@ -44,6 +44,10 @@
 @media(max-width:900px){.app-sidebar{position:fixed;left:0;top:0;bottom:0;transform:translateX(-100%);transition:transform .25s ease;box-shadow:0 20px 25px -5px rgba(0,0,0,.2)}.app-sidebar.open{transform:translateX(0)}.app-layout.topnav .app-sidebar{position:sticky;transform:none}.app-content{padding:16px}.app-topbar .mobile-toggle{display:inline-flex;align-items:center;justify-content:center;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;width:40px;height:40px;font-size:1.2rem;cursor:pointer}}
 @media(min-width:901px){.app-topbar .mobile-toggle{display:none}}
 </style>
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+    <meta name="author" content="HMG Concepts">
+    <link rel="canonical" href="./cbt.html">
+    <meta property="og:url" content="./cbt.html">
 </head>
 <body data-theme="theme2" data-school="School Connect Demo School" data-font="raleway">
 
@@ -88,7 +92,7 @@
 <div class="app-layout layout1" data-require-role="super_admin admin principal proprietor head_teacher bursar staff teacher">
   <aside class="app-sidebar" id="app-sidebar">
       <div class="app-brand">
-        <img src="assets/img/logo.svg" alt="School Connect Demo School" style="object-fit:contain" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('div'),{textContent:('G'),style:'width:40px;height:40px;border-radius:10px;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900'}))">
+        <img src="assets/img/logo.svg" alt="School Connect Demo School" style="object-fit:contain" onerror="this.onerror=null;this.src='assets/img/logo.svg'">
         <div>
           <strong>School Connect Demo School</strong>
           <div style="font-size:0.7rem;color:var(--gray-500)">SCD</div>
@@ -116,6 +120,9 @@
         </a><a href="attendance.html" data-module-id="attendance" data-role-allow="super_admin admin principal proprietor head_teacher bursar staff teacher parent student" class="">
           <span class="app-nav-icon">📋</span>
           <span>Attendance</span>
+        </a><a href="punctuality.html" data-module-id="punctuality" data-role-allow="super_admin admin principal proprietor head_teacher bursar staff teacher" class="">
+          <span class="app-nav-icon">⏱️</span>
+          <span>Punctuality</span>
         </a><a href="cbt-prompts.html" data-module-id="cbt-prompts" data-role-allow="super_admin admin principal proprietor head_teacher bursar staff teacher" class="">
           <span class="app-nav-icon">🧩</span>
           <span>AI Question Prompts</span>
@@ -416,6 +423,7 @@
         <button class="btn btn-outline" onclick="CBTUI.downloadTemplate()">⬇ CSV Template</button>
         <button class="btn btn-outline" onclick="CBTUI.refresh()">↻ Refresh</button>
         <button class="btn btn-outline" onclick="CBTUI.importBackup()">📥 Import offline backup (JSON)</button>
+        <button class="btn btn-outline" onclick="CBTUI.exportExamListCSV()">⬇ Export exam list</button>
       </div>
       <div class="card" style="margin-bottom:18px">
         <p style="color:var(--gray-600);margin:0">
@@ -426,6 +434,18 @@
         </p>
       </div>
       <div id="cbt-list"><span class="pulse">Loading exams…</span></div>
+    
+      <div class="card" style="margin-top:16px;background:#f0fdf4;border:1px solid #bbf7d0">
+        <h3 style="margin-top:0">📊 CBT → Report Card Mapping (Mid-Term & Terminal)</h3>
+        <p style="color:var(--gray-700)">CBT is used for <strong>mid-term tests (CA1/CA2)</strong> and <strong>terminal examination objectives (Exam)</strong>. After students submit, push scores into Results table with column selection (CA1, CA2, CA3, CBT Exam, Exam, Project, etc). Then generate <strong>class broadsheet, subject broadsheet and report card</strong> from Report Cards page — all automatically.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="ReportEngine.openCBTExportModal()">🚀 Push CBT Scores → Report Card (choose column)</button>
+          <a class="btn btn-outline btn-sm" href="report-cards.html">📄 Open Report Cards</a>
+          <a class="btn btn-outline btn-sm" href="academic-records.html">📊 Broadsheets</a>
+        </div>
+        <p style="font-size:.82rem;color:var(--gray-500);margin-top:8px">Tip: When creating a CBT exam, set <em>Report-card column</em> (e.g. CA1 for mid-term, Exam for terminal) and <em>Max score contribution</em> (e.g. 20). Scores are scaled accordingly.</p>
+      </div>
+
     </div>
     <footer style="padding:20px 28px;border-top:1px solid var(--gray-200);font-size:0.82rem;color:var(--gray-500);text-align:center">
       © 2026 School Connect Demo School · Built by <a href="https://cssadewale.pages.dev" target="_blank" rel="noopener">Adewale Samson Adeagbo</a> · Powered by <a href="https://hmgconcepts.pages.dev/" target="_blank" rel="noopener">HMG Concepts</a> · <a href="developer.html">About the developer</a>
@@ -510,11 +530,14 @@ window.CBTUI = {
         '<td style="white-space:nowrap">'+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.toggle(\''+e.id+'\','+(!e.is_open)+')">'+(e.is_open?'Close':'Open')+'</button> '+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.share(\''+esc(e.code)+'\')">Share</button> '+
+          '<button class="btn btn-sm btn-outline" onclick="CBTUI.exportExamCSV(\''+e.id+'\')">Exam CSV</button> '+
+          '<button class="btn btn-sm btn-outline" onclick="CBTUI.exportExamPDF(\''+e.id+'\')">Exam PDF</button> '+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.results(\''+e.id+'\',\''+esc(e.code)+'\')">Results</button> '+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.preview(\''+e.id+'\')">Preview</button> '+
           (CBTUI.canManageExam(e) ? '<button class="btn btn-sm btn-primary" onclick="CBTUI.edit(\''+e.id+'\')">✏️ Edit</button> '+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.editQuestions(\''+e.id+'\')">Edit Questions</button> '+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.appendCSV(\''+e.id+'\')">Attach CSV</button> '+
+          '<button class="btn btn-sm btn-outline" onclick="CBTUI.importExamCSV(\''+e.id+'\')">Import CSV</button> '+
           '<button class="btn btn-sm btn-outline" onclick="CBTUI.repairTabs(\''+e.id+'\')">Repair Tabs</button> '+
           '<button class="btn btn-sm btn-outline" data-admin-only onclick="CBTUI.del(\''+e.id+'\')">Delete</button>' : '<span class="badge" title="Only the creator teacher or an admin can edit this exam">Read-only</span>')+
         '</td></tr>').join('')+'</tbody></table></div>';
@@ -759,8 +782,17 @@ window.CBTUI = {
     if(!sb)return;
     const { data } = await sb.from('cbt_results').select('*').eq('exam_id',id).order('score',{ascending:false});
     const rows=(data||[]).map((r,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(r.student_name)+'</td><td>'+esc(r.student_id_ref||'-')+'</td><td>'+r.score+'/'+r.total+'</td><td>'+(r.percent||0)+'%</td><td>'+esc(r.cert_code||'-')+'</td></tr>').join('');
-    openModal('Results — '+code, '<div style="margin-bottom:10px"><button class="btn btn-sm btn-outline" onclick="CBTUI.exportCSV(\''+id+'\')">⬇ Export CSV</button></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Name</th><th>ID</th><th>Score</th><th>%</th><th>Cert</th></tr></thead><tbody>'+(rows||'<tr><td colspan=6>No submissions yet.</td></tr>')+'</tbody></table></div>');
+    openModal('Results — '+code, '<div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm btn-outline" onclick="CBTUI.exportCSV(\''+id+'\')">⬇ Export CSV</button><button class="btn btn-sm btn-outline" onclick="CBTUI.exportResultsPDF(\''+id+'\',\''+esc(code)+'\')">📄 Export PDF</button><button class="btn btn-sm btn-outline" onclick="CBTUI.exportResultsJSON(\''+id+'\')">⬇ Export JSON</button></div><div class="table-wrap"><table><thead><tr><th>#</th><th>Name</th><th>ID</th><th>Score</th><th>%</th><th>Cert</th></tr></thead><tbody>'+(rows||'<tr><td colspan=6>No submissions yet.</td></tr>')+'</tbody></table></div>');
   },
+  _download(name, body, type){ const blob=new Blob([body],{type:type||'text/plain'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); },
+  _csvCell(v){ return '"'+String(v==null?'':v).replace(/"/g,'""')+'"'; },
+  _questionCSV(q){ const get=(...ks)=>{for(const k of ks){if(q&&q[k]!=null)return q[k];}return '';}; return [get('question','Question'),get('a','A'),get('b','B'),get('c','C'),get('d','D'),get('answer','correct','correct_answer'),get('explanation'),get('type'),get('tolerance'),get('unit'),get('accept'),get('mrq_aon'),get('pairs'),get('items'),get('difficulty'),get('tags'),get('section','subject')].map(this._csvCell).join(','); },
+  async exportExamCSV(id){ const {data:e,error}=await sb.from('cbt_exams').select('*').eq('id',id).maybeSingle(); if(error||!e){toast('Could not load exam: '+(error?.message||'not found'),'danger');return;} const qs=e.csv_data||e.questions||[]; const head='Question,Option A,Option B,Option C,Option D,Correct Answer,Explanation,Type,Tolerance,Unit,Accept,MRQ_AON,Pairs,Items,Difficulty,Tags,Section\n'; this._download('exam-'+(e.code||id)+'.csv',head+qs.map(q=>this._questionCSV(q)).join('\n'),'text/csv'); toast('Exam question bank exported as CSV.','success'); },
+  async exportExamPDF(id){ const {data:e,error}=await sb.from('cbt_exams').select('*').eq('id',id).maybeSingle(); if(error||!e){toast('Could not load exam: '+(error?.message||'not found'),'danger');return;} const qs=e.csv_data||e.questions||[]; const rows=qs.map((q,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(q.question||'')+'</td><td>'+esc(q.type||'')+'</td><td>'+esc(q.answer||q.correct||q.correct_answer||'')+'</td><td>'+esc(q.mark||1)+'</td></tr>').join(''); const w=window.open('','_blank'); if(!w){toast('Allow popups to export PDF.','warning');return;} w.document.write('<!doctype html><html><head><title>Exam '+esc(e.code)+'</title><style>body{font-family:Arial;padding:24px}h1{text-align:center}table{width:100%;border-collapse:collapse}th,td{border:1px solid #aaa;padding:6px;text-align:left}th{background:#eef2ff}@media print{button{display:none}}</style></head><body><h1>'+esc(e.title||'CBT Exam')+'</h1><p><b>Code:</b> '+esc(e.code)+' &nbsp; <b>Subject:</b> '+esc(e.subject)+' &nbsp; <b>Class:</b> '+esc(e.class||'')+'</p><table><thead><tr><th>#</th><th>Question</th><th>Type</th><th>Answer</th><th>Mark</th></tr></thead><tbody>'+rows+'</tbody></table><p>Powered by HMG Concepts School Connect</p><script>window.onload=function(){window.print()}<\/script></body></html>'); w.document.close(); },
+  async importExamCSV(id){ const input=document.createElement('input'); input.type='file'; input.accept='.csv,text/csv'; input.onchange=async()=>{const file=input.files&&input.files[0];if(!file)return;const txt=await file.text();const qs=CBT.parseCSV(txt);if(!qs.length){toast('No valid questions found in CSV.','warning');return;}const {data:e}=await sb.from('cbt_exams').select('csv_data').eq('id',id).maybeSingle();const old=(e&&e.csv_data)||[];const {error}=await sb.from('cbt_exams').update({csv_data:old.concat(qs),updated_at:new Date().toISOString()}).eq('id',id);if(error){toast(error.message,'danger');return;}toast('CSV imported and appended to the exam.','success');CBTUI.refresh();}; input.click(); },
+  async exportExamListCSV(){ const {data,error}=await sb.from('cbt_exams').select('code,title,subject,class,term,session,exam_mode,is_open,report_column,created_at').order('created_at',{ascending:false}); if(error){toast(error.message,'danger');return;} const head='Code,Title,Subject,Class,Term,Session,Mode,Open,ReportColumn,CreatedAt\n'; const body=(data||[]).map(e=>[e.code,e.title,e.subject,e.class,e.term,e.session,e.exam_mode,e.is_open,e.report_column,e.created_at].map(this._csvCell).join(',')).join('\n'); this._download('school-connect-exams.csv',head+body,'text/csv'); },
+  async exportResultsJSON(id){ const {data,error}=await sb.from('cbt_results').select('*').eq('exam_id',id).order('score',{ascending:false}); if(error){toast(error.message,'danger');return;} this._download('cbt-results-'+id+'.json',JSON.stringify(data||[],null,2),'application/json'); },
+  async exportResultsPDF(id,code){ const {data,error}=await sb.from('cbt_results').select('*').eq('exam_id',id).order('score',{ascending:false}); if(error){toast(error.message,'danger');return;} const rows=(data||[]).map((r,i)=>'<tr><td>'+(i+1)+'</td><td>'+esc(r.student_name)+'</td><td>'+esc(r.student_id_ref||'')+'</td><td>'+esc(r.student_class||'')+'</td><td>'+esc(r.score)+'/'+esc(r.total)+'</td><td>'+esc(r.percent||0)+'%</td><td>'+esc(r.cert_code||'')+'</td></tr>').join(''); const w=window.open('','_blank');if(!w){toast('Allow popups to export PDF.','warning');return;}w.document.write('<!doctype html><html><head><title>CBT Results '+esc(code||'')+'</title><style>body{font-family:Arial;padding:24px}h1{text-align:center}table{width:100%;border-collapse:collapse}th,td{border:1px solid #aaa;padding:6px}th{background:#eef2ff}</style></head><body><h1>CBT Results — '+esc(code||'')+'</h1><table><thead><tr><th>#</th><th>Name</th><th>ID</th><th>Class</th><th>Score</th><th>Percent</th><th>Certificate</th></tr></thead><tbody>'+rows+'</tbody></table><script>window.onload=function(){window.print()}<\/script></body></html>');w.document.close(); },
   async exportCSV(id){
     const { data } = await sb.from('cbt_results').select('*').eq('exam_id',id);
     const head='Name,StudentID,Class,Score,Total,Percent,Correct,Wrong,Skipped,Cert,SubmittedAt\n';
