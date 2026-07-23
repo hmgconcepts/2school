@@ -1,6 +1,15 @@
 -- ============================================================================
--- HMG SCHOOL CONNECT v12.1 — ONE CLEAN PRODUCTION DATABASE SCHEMA
+-- HMG SCHOOL CONNECT v12.4 — ONE CLEAN PRODUCTION DATABASE SCHEMA
 -- ----------------------------------------------------------------------------
+-- v12.4 (2026-07-23): PUNCTUALITY POINTS ENGINE (Section 17, additive): on-time
+--   check-in + closing-time check-out earn daily points; term totals can be
+--   pushed into any Results column at the school's discretion. Also standalone
+--   as database/punctuality-points.sql. CBT scale pack (Section 16) included.
+-- v12.3 (2026-07-23): CBT 1000-CONCURRENT SCALE PACK (Section 16, additive):
+--   hot-path indexes, idempotent exam submissions (client_ref), and the v2
+--   exam-fetch / submit functions preferred by cbt-exam.html. The very same
+--   pack also ships standalone as database/cbt-1000-scale.sql for projects
+--   already running v12.x. v12.2's site-license engine is untouched.
 -- v12.1 (2026-07-22): extended the 42703 drift-hardening block so EVERY
 -- column referenced by any policy / view / SQL function / constraint / index
 -- is force-added on pre-existing old-generation tables (support_plans,
@@ -2360,7 +2369,287 @@ end $$;
 
 
 -- ============================================================================
--- SECTION 16: POSTGREST SCHEMA CACHE RELOAD (kills "schema cache" errors instantly)
+-- SECTION 16: CBT 1000-CONCURRENT SCALE PACK (v12.3 — additive; same content
+-- as database/cbt-1000-scale.sql. See that file for the full commentary.)
+-- ============================================================================
+
+create index if not exists cbt_exams_upper_code_idx on public.cbt_exams (upper(code));
+create index if not exists cbt_results_exam_idx        on public.cbt_results (exam_id);
+create index if not exists cbt_results_exam_time_idx   on public.cbt_results (exam_id, submitted_at desc);
+create index if not exists cbt_results_student_ref_idx on public.cbt_results (exam_id, student_id_ref);
+
+alter table public.cbt_results add column if not exists client_ref text;
+create unique index if not exists cbt_results_client_ref_uidx
+  on public.cbt_results (exam_id, client_ref)
+  where client_ref is not null and client_ref <> '';
+
+create or replace function public.cbt_get_public_exam_v2(p_code text)
+returns jsonb language plpgsql security definer stable set search_path=public as $$
+declare e record; qs jsonb;
+begin
+  select * into e from public.cbt_exams
+   where upper(code)=upper(trim(p_code)) and is_open=true and is_archived=false limit 1;
+  if not found then return null; end if;
+  if e.start_at is not null and now()<e.start_at then
+    return jsonb_build_object('wait',true,'start_at',e.start_at,'title',e.title,'server_now',now());
+  end if;
+  if e.close_at is not null and now()>e.close_at then
+    return jsonb_build_object('closed',true,'server_now',now());
+  end if;
+  select coalesce(jsonb_agg((q-'correct'-'correct_answer'-'answer'-'explanation')||jsonb_build_object('_orig_index',ord-1) order by ord),'[]'::jsonb)
+    into qs
+    from jsonb_array_elements(coalesce(e.csv_data,e.questions,'[]'::jsonb)) with ordinality x(q,ord);
+  return jsonb_build_object(
+    'id',e.id,'code',e.code,'title',e.title,'subject',e.subject,'class',e.class,
+    'term',e.term,'session',e.session,'assessment_type',e.assessment_type,
+    'duration',coalesce(nullif(e.duration_min,0),e.duration,45),
+    'questions',qs,'_questions',qs,
+    'report_column',e.report_column,'max_score',e.max_score,'exam_mode',e.exam_mode,
+    'server_now',now(),'start_at',e.start_at,'close_at',e.close_at,
+    'instructions',e.instructions,'anti_cheat_config',e.anti_cheat_config,
+    'attempt_limit',e.attempt_limit,'randomise',e.randomise,'select_count',e.select_count,
+    'pass_mark',e.pass_mark,'release_results',e.release_results,
+    'certificate_enabled',e.certificate_enabled
+  );
+end $$;
+
+create or replace function public.cbt_submit_v2(p_payload jsonb)
+returns jsonb language plpgsql security definer set search_path=public as $$
+declare
+  e record; r record; rid uuid; sid uuid; n int; taken int := 0;
+  score numeric := 0; total numeric := 0; cc int := 0; wc int := 0; sc int := 0;
+  ans jsonb; q jsonb; i int := 0; a text; k text; mark numeric;
+  ref text := nullif(p_payload->>'client_ref','');
+begin
+  select * into e from public.cbt_exams where id=(p_payload->>'exam_id')::uuid;
+  if not found then return jsonb_build_object('saved',false,'error','Exam not found'); end if;
+  if e.close_at is not null and now() > e.close_at + interval '120 seconds' then
+    return jsonb_build_object('saved',false,'error','closed','message','This exam has closed. Your answers were not recorded.');
+  end if;
+  if ref is not null then
+    select * into r from public.cbt_results where exam_id=e.id and client_ref=ref limit 1;
+    if found then
+      return jsonb_build_object('saved',true,'duplicate',true,'result_id',r.id,'score',r.score,'total',r.total,'percent',r.percent,
+        'correct_count',r.correct_count,'wrong_count',r.wrong_count,'skipped_count',r.skipped_count,
+        'cert_code',r.cert_code,'release_results',e.release_results,'report_column',e.report_column);
+    end if;
+    if nullif(p_payload->>'student_id_ref','') is not null and coalesce(e.attempt_limit,0) > 0 then
+      select count(*) into taken from public.cbt_results where exam_id=e.id and student_id_ref=p_payload->>'student_id_ref';
+      if taken >= e.attempt_limit then
+        return jsonb_build_object('saved',false,'error','attempts_exhausted','message','Attempt limit ('||e.attempt_limit||') reached for this exam.');
+      end if;
+    end if;
+  end if;
+  for ans in select * from jsonb_array_elements(coalesce(p_payload->'answers_data','[]'::jsonb)) loop
+    q := coalesce(e.csv_data,e.questions,'[]'::jsonb)
+          -> (case when coalesce(ans->>'index','') ~ '^[0-9]+$' then (ans->>'index')::int else i end);
+    mark := coalesce(nullif(q->>'mark','')::numeric,1); total := total + mark;
+    a := coalesce(ans->>'answer', ans #>> '{}', '');
+    k := coalesce(q->>'answer', q->>'correct', q->>'correct_answer', '');
+    if a is null or trim(a) = '' then sc := sc + 1;
+    elsif k <> '' and lower(trim(a)) = lower(trim(k)) then score := score + mark; cc := cc + 1;
+    else wc := wc + 1; end if;
+    i := i + 1;
+  end loop;
+  sid := nullif(p_payload->>'student_id','')::uuid;
+  n := case when total>0 then round(score/total*100)::int else 0 end;
+  begin
+    insert into public.cbt_results(
+      exam_id,student_id,student_name,student_class,student_id_ref,student_type,
+      score,total,percent,correct_count,wrong_count,skipped_count,
+      attempt_number,time_taken,violations,violation_log,answers_data,cert_code,client_ref
+    ) values (
+      e.id,sid,coalesce(p_payload->>'student_name','Anonymous'),coalesce(p_payload->>'student_class',e.class),
+      coalesce(p_payload->>'student_id_ref',''),coalesce(p_payload->>'student_type',e.exam_mode),
+      score,total::int,n,cc,wc,sc,
+      taken+1,coalesce((p_payload->>'time_taken')::int,0),coalesce((p_payload->>'violations')::int,0),
+      coalesce(p_payload->'violation_log','[]'::jsonb),p_payload->'answers_data',
+      case when e.certificate_enabled then 'CERT-'||upper(substr(md5(random()::text),1,8)) else '' end,
+      ref
+    ) returning id into rid;
+  exception when unique_violation then
+    select * into r from public.cbt_results where exam_id=e.id and client_ref=ref limit 1;
+    if found then
+      return jsonb_build_object('saved',true,'duplicate',true,'result_id',r.id,'score',r.score,'total',r.total,'percent',r.percent,
+        'correct_count',r.correct_count,'wrong_count',r.wrong_count,'skipped_count',r.skipped_count,
+        'cert_code',r.cert_code,'release_results',e.release_results,'report_column',e.report_column);
+    end if;
+    return jsonb_build_object('saved',false,'error','Duplicate submission conflict');
+  end;
+  return jsonb_build_object('saved',true,'result_id',rid,'score',score,'total',total,'percent',n,
+    'correct_count',cc,'wrong_count',wc,'skipped_count',sc,'cert_code',
+    (select cert_code from public.cbt_results where id=rid),
+    'release_results',e.release_results,'report_column',e.report_column);
+exception when others then return jsonb_build_object('saved',false,'error',sqlerrm);
+end $$;
+
+grant execute on function public.cbt_get_public_exam_v2(text) to anon, authenticated;
+grant execute on function public.cbt_submit_v2(jsonb)         to anon, authenticated;
+
+analyze public.cbt_exams;
+analyze public.cbt_results;
+
+-- ============================================================================
+-- SECTION 17: PUNCTUALITY POINTS ENGINE (v12.4 — additive; same content as
+-- database/punctuality-points.sql. See that file for the full commentary.)
+-- ============================================================================
+
+-- ── 1) CONFIG (single row, tuned by the school) ─────────────────────────────
+create table if not exists public.punctuality_config (
+  id int primary key default 1 check (id = 1),
+  deadline time not null default '07:30:00',       -- check-in at/before = on time
+  checkout_open time not null default '12:30:00',  -- check-out at/after = stayed through closing
+  points_full numeric not null default 2,          -- points for a fully-punctual day
+  points_partial numeric not null default 0,       -- points for on-time check-in WITHOUT a qualified check-out (0 = strict mode)
+  require_checkout boolean not null default true,  -- when false, on-time check-in alone earns full points
+  enabled boolean not null default true,
+  updated_at timestamptz not null default now()
+);
+insert into public.punctuality_config (id) values (1) on conflict (id) do nothing;
+
+-- ── 2) DAILY AWARDS ─────────────────────────────────────────────────────────
+create table if not exists public.punctuality_awards (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students(id) on delete cascade,
+  student_id_ref text not null default '', student_name text not null default '',
+  class text not null default '',
+  date date not null,
+  checkin_at timestamptz, checkout_at timestamptz,
+  points numeric not null default 0,
+  rule text not null default 'none',  -- full | partial | late | no_checkout | config_disabled
+  created_at timestamptz not null default now(),
+  unique(student_id, date)
+);
+create index if not exists punctuality_awards_date_idx    on public.punctuality_awards (date);
+create index if not exists punctuality_awards_class_idx   on public.punctuality_awards (class, date);
+create index if not exists punctuality_awards_student_idx on public.punctuality_awards (student_id, date);
+
+-- Results push columns (repairs latent fresh-install gap: the CBT → Report
+-- Card push and the punctuality push both need these on results):
+alter table if exists public.results add column if not exists student_name text;
+alter table if exists public.results add column if not exists student_id_ref text not null default '';
+alter table if exists public.results add column if not exists assessment_source text not null default 'manual';
+alter table if exists public.results add column if not exists assessment_ref uuid;
+create unique index if not exists results_assessment_uidx on public.results (assessment_source, assessment_ref);
+
+-- ── 3) DAILY COMPUTE — grade every checked student for one date ─────────────
+create or replace function public.compute_punctuality_awards(p_date date default current_date, p_class text default '')
+returns int language plpgsql security definer set search_path=public as $$
+declare
+  cfg record; awarded int := 0;
+begin
+  select * into cfg from public.punctuality_config where id = 1;
+  if cfg is null then
+    insert into public.punctuality_config (id) values (1) on conflict (id) do nothing returning * into cfg;
+    if cfg is null then select * into cfg from public.punctuality_config where id = 1; end if;
+  end if;
+
+  -- Re-grade the day from student_clock (first clock-in, last clock-out). A
+  -- row with points 0 is kept too, so staff can see exactly WHY no point.
+  insert into public.punctuality_awards
+    (student_id, student_id_ref, student_name, class, date, checkin_at, checkout_at, points, rule)
+  select
+    s.id, coalesce(s.admission_no,''), coalesce(s.full_name,''), coalesce(s.class,''),
+    p_date, t.first_in, t.last_out,
+    case
+      when not cfg.enabled then 0
+      when t.first_in::time <= cfg.deadline and (not cfg.require_checkout) then cfg.points_full
+      when t.first_in::time <= cfg.deadline and t.last_out is not null and t.last_out::time >= cfg.checkout_open then cfg.points_full
+      when t.first_in::time <= cfg.deadline then cfg.points_partial
+      else 0
+    end,
+    case
+      when not cfg.enabled then 'config_disabled'
+      when t.first_in::time <= cfg.deadline and (not cfg.require_checkout) then 'full'
+      when t.first_in::time <= cfg.deadline and t.last_out is not null and t.last_out::time >= cfg.checkout_open then 'full'
+      when t.first_in::time <= cfg.deadline then 'no_checkout'
+      else 'late'
+    end
+  from (
+    select sc.student_id, min(sc.clock_in) as first_in, max(sc.clock_out) as last_out
+      from public.student_clock sc
+     where sc.date = p_date and sc.student_id is not null
+     group by sc.student_id
+  ) t
+  join public.students s on s.id = t.student_id
+  where (p_class = '' or s.class = p_class)
+  on conflict (student_id, date) do update
+    set checkin_at = excluded.checkin_at, checkout_at = excluded.checkout_at,
+        points = excluded.points, rule = excluded.rule,
+        student_id_ref = excluded.student_id_ref, student_name = excluded.student_name,
+        class = excluded.class;
+
+  select coalesce(sum(case when points > 0 then 1 else 0 end),0)::int into awarded
+    from public.punctuality_awards
+   where date = p_date and (p_class = '' or class = p_class);
+  return awarded;
+end $$;
+
+-- ── 4) PUSH TERM POINTS INTO RESULTS (school's choice of column) ────────────
+-- Mirrors the CBT → Report Card flow: one Results row per student carrying
+-- their point total in the chosen column. assessment_ref is deterministic
+-- (md5 → uuid), so re-pushing the same term/class/range UPDATES, never dupes.
+create or replace function public.sc_push_punctuality_to_results(
+  p_term text, p_session text, p_column text default 'ca2', p_class text default '',
+  p_start date default null, p_end date default null, p_subject text default 'PUNCTUALITY')
+returns int language plpgsql security definer set search_path=public as $$
+declare
+  saved int := 0; r record; ref uuid; col text := lower(trim(p_column));
+begin
+  -- Column must be a REAL numeric column on results (ca1/ca2/ca3/exam or any
+  -- custom numeric column the report engine added).
+  if not exists (select 1 from information_schema.columns
+                  where table_schema='public' and table_name='results'
+                    and column_name=col and data_type='numeric') then
+    raise exception 'Punctuality push: "%" is not a numeric Results column. Use ca1/ca2/ca3/exam or a custom numeric report column.', col;
+  end if;
+
+  for r in
+    select a.student_id,
+           max(a.student_name) as student_name, max(a.student_id_ref) as student_id_ref,
+           coalesce(nullif(p_class,''), max(a.class)) as class,
+           sum(a.points) as points
+      from public.punctuality_awards a
+      join public.students s on s.id = a.student_id
+     where (p_class = '' or a.class = p_class or s.class = p_class)
+       and (p_start is null or a.date >= p_start)
+       and (p_end   is null or a.date <= p_end)
+     group by a.student_id
+  loop
+    ref := md5('punctuality|'||r.student_id::text||'|'||coalesce(p_term,'')||'|'||coalesce(p_session,'')||'|'||col||'|'||coalesce(nullif(p_class,''),r.class,''))::uuid;
+    execute format(
+      'insert into public.results (student_id, student_name, student_id_ref, subject, class, term, session, assessment_source, assessment_ref, %I)
+       values ($1,$2,$3,$4,$5,$6,$7,''punctuality'',$8,$9)
+       on conflict (assessment_source, assessment_ref)
+       do update set %I = excluded.%I, student_name = excluded.student_name, class = excluded.class, term = excluded.term, session = excluded.session', col, col, col)
+      using r.student_id, r.student_name, r.student_id_ref, p_subject, r.class, p_term, p_session, ref, r.points;
+    saved := saved + 1;
+  end loop;
+  return saved;
+end $$;
+
+-- ── 5) RLS (mirrors student_clock: staff manage; student/parent read own) ───
+alter table public.punctuality_config enable row level security;
+alter table public.punctuality_awards enable row level security;
+
+drop policy if exists "punctuality_config_read" on public.punctuality_config;
+create policy "punctuality_config_read" on public.punctuality_config for select using (auth.role()='authenticated');
+drop policy if exists "punctuality_config_write" on public.punctuality_config;
+create policy "punctuality_config_write" on public.punctuality_config for all using (public.is_staff(auth.uid())) with check (public.is_staff(auth.uid()));
+
+drop policy if exists "punctuality_awards_read" on public.punctuality_awards;
+create policy "punctuality_awards_read" on public.punctuality_awards for select using (
+  public.is_staff(auth.uid()) or public.is_parent_of(auth.uid(), student_id)
+  or exists (select 1 from public.students s where s.id = punctuality_awards.student_id and s.user_id = auth.uid()));
+drop policy if exists "punctuality_awards_write" on public.punctuality_awards;
+create policy "punctuality_awards_write" on public.punctuality_awards for all using (public.is_staff(auth.uid())) with check (public.is_staff(auth.uid()));
+
+grant execute on function public.compute_punctuality_awards(date, text) to authenticated;
+grant execute on function public.sc_push_punctuality_to_results(text, text, text, text, date, date, text) to authenticated;
+
+
+-- ============================================================================
+-- SECTION 18: POSTGREST SCHEMA CACHE RELOAD (kills "schema cache" errors instantly)
 -- ============================================================================
 
 -- PostgREST caches the OpenAPI schema; after DDL it can briefly serve
@@ -2368,4 +2657,4 @@ end $$;
 notify pgrst, 'reload schema';
 select pg_notify('pgrst','reload schema');
 
-select 'School Connect v12.2 clean schema installed successfully ✅' as status;
+select 'School Connect v12.4 clean schema installed successfully ✅ (CBT scale pack + Punctuality Points engine included)' as status;
