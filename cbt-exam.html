@@ -104,10 +104,24 @@
 <script>
 CBT.init(sb);
 const Exam = {
-  data:null, answers:[], idx:0, timer:null, remaining:0, monitor:null, flags:{}, startTs:0,
+  data:null, answers:[], idx:0, timer:null, remaining:0, monitor:null, flags:{}, startTs:0, offset:0, clientRef:null,
   qs(){ return (this.data && (this.data._questions || this.data.questions || this.data.csv_data)) || []; },
   param(){ const u=new URLSearchParams(location.search); return (u.get('code')||u.get('exam')||u.get('c')||'').toUpperCase().trim(); },
   root(){ return document.getElementById('exam-root'); },
+  now(){ return Date.now() + (this.offset||0); },
+  // ENTERPRISE V14 helpers (1000-candidate scale pack) ----------------------
+  // One stable id per sitting: makes cbt_submit_v2 calls IDEMPOTENT — retries
+  // after network drops return the original result instead of duplicating.
+  newRef(){ const c=(this.data&&this.data.code)||this.param()||'EXAM'; const u=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():(Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12)); return c+'-'+u; },
+  _missingFn(err){ return /PGRST202|schema cache|Could not find the function|does not exist|404/i.test(String(err&&(err.message||err.code||err.details)||'')); },
+  // v2 (scale pack) first, v1 fallback — older schemas keep working 100%.
+  async _submitRpc(p){
+    if(!this._noV2){
+      try{ const r=await sb.rpc('cbt_submit_v2',{p_payload:p}); if(r.error && this._missingFn(r.error)) this._noV2=true; else return r; }
+      catch(e){ return {error:e}; }
+    }
+    try{ return await sb.rpc('cbt_submit',{p_payload:p}); }catch(e){ return {error:e}; }
+  },
   async start(){
     const code=this.param();
     if(code){ this.codeEntry(code); } else { this.codeEntry(''); }
@@ -132,17 +146,28 @@ const Exam = {
     this.student={ name:nm, id_ref:document.getElementById('e-id').value.trim(), class:document.getElementById('e-class').value.trim(), anonymous:!!anon };
     if(!code){ toast('Enter the exam code.','warning'); return; }
     if(!this.student.name){ this.student.name='Anonymous-'+Math.random().toString(36).slice(2,7).toUpperCase(); }
-    // ENTERPRISE V9 (issue 8: 400+ concurrent candidates):
-    // 1) exam-load retries with exponential backoff + jitter (absorbs the
-    //    thundering herd when a whole hall presses Start together);
-    // 2) a 10-minute local exam cache so refreshes/re-entries NEVER re-hit
-    //    the database — each candidate costs exactly ONE indexed read.
+    // ENTERPRISE V9 (issue 8: 400+ concurrent candidates): exam-load retries
+    // with exponential backoff + jitter absorb the thundering herd.
+    // ENTERPRISE V14 (issue 44: 1000 SIMULTANEOUS candidates):
+    // 1) a 300–1800 ms START JITTER spreads the "whole hall presses Start at
+    //    once" burst across two seconds — no single-second spike;
+    // 2) cbt_get_public_exam_v2 preferred (server clock, exam window, integrity
+    //    config, attempt limits) with automatic v1 fallback on older schemas;
+    // 3) the 10-minute local exam cache means refreshes/re-entries NEVER
+    //    re-hit the database — each candidate costs exactly ONE indexed read.
     let data=null, error=null;
     const cacheKey='cbt-exam-cache-'+code;
     try{ const c=JSON.parse(localStorage.getItem(cacheKey)||'null'); if(c && (Date.now()-c.at)<600000){ data=c.exam; } }catch(_){}
     if(!data){
+      await new Promise(r=>setTimeout(r, 300+Math.floor(Math.random()*1500))); // start jitter
       for(let attempt=0;attempt<5;attempt++){
-        try{ const r=await sb.rpc('cbt_get_public_exam', { p_code: code }); data=r.data; error=r.error; }catch(e){ error=e; }
+        let r=null;
+        if(!this._noV2){
+          try{ r=await sb.rpc('cbt_get_public_exam_v2', { p_code: code }); if(r.error && this._missingFn(r.error)) this._noV2=true; }
+          catch(e){ r={error:e}; }
+        }
+        if(this._noV2){ try{ r=await sb.rpc('cbt_get_public_exam', { p_code: code }); }catch(e){ r={error:e}; } }
+        data=r? r.data:null; error=r? r.error:{message:'Network error'};
         if(data && !error) break;
         const wait=Math.min(6000,(400*Math.pow(2,attempt)))+Math.floor(Math.random()*500);
         toast('Busy server — retrying ('+(attempt+1)+'/5)…','info',1500);
@@ -157,7 +182,33 @@ const Exam = {
     try { const sections = [...new Set(this.qs().map(q => (q.section || q.subject || 'General')).filter(Boolean))]; if (String(this.data.subject || '').toLowerCase().startsWith('multi-subject') && sections.length <= 1) { console.warn('[CBT] Multi-subject exam loaded without distinct subject tabs. Check subject_breakdown and per-question subject metadata.'); } } catch(_) {}
     try { const sections = [...new Set(this.qs().map(q => (q.section || q.subject || 'General')).filter(Boolean))]; if (String(this.data.subject || '').toLowerCase().startsWith('multi-subject') && sections.length <= 1) { console.warn('[CBT] Multi-subject exam loaded without distinct subject tabs. Check subject_breakdown and per-question subject metadata.'); } } catch(_) {}
     this.answers=new Array(this.qs().length).fill(null);
-    this.remaining=(data.duration||45)*60; this.startTs=Date.now(); this.deadline = Date.now() + (this.remaining * 1000);
+    // ENTERPRISE V14: SERVER CLOCK. v2 returns server_now, so the countdown
+    // follows the SERVER, not a wrong device clock; on v1/legacy schemas the
+    // offset is simply 0 (previous behaviour, unchanged).
+    this.offset = data.server_now ? (Date.parse(data.server_now) - Date.now()) : 0;
+    if(!isFinite(this.offset)) this.offset=0;
+    this.remaining=(data.duration||45)*60; this.startTs=this.now(); this.deadline = this.startTs + (this.remaining * 1000);
+    // Clamp the deadline to the exam window (close_at + the server's own 120s grace).
+    if(data.close_at){ const cap=Date.parse(data.close_at)+120000; if(isFinite(cap) && cap<this.deadline) this.deadline=cap; }
+    if(this.deadline<=this.now()){ this.root().innerHTML='<div class="card"><h3>🚫 Time over</h3><p>The time window for this exam has elapsed.</p></div>'; return; }
+    // ENTERPRISE V14: crash / refresh / power-cut RESUME. Answers are keyed
+    // by each question's _orig_index, so they survive question shuffling;
+    // the ORIGINAL attempt ref + deadline are restored — no work is lost and
+    // restarting the browser never buys extra time or a duplicate result.
+    this.clientRef=this.newRef();
+    try{
+      const draft=JSON.parse(localStorage.getItem('cbt-draft-'+this.data.code)||'null');
+      if(draft && Array.isArray(draft.a) && draft.a.length===this.qs().length && draft.a.some(x=>x && x.v!=null) && draft.d && Date.now()<draft.d){
+        if(confirm('An unfinished attempt at this exam was found on this device.\n\nResume where you stopped? Your answers and remaining time are kept.')){
+          const map={}; draft.a.forEach(x=>{ if(x) map[x.o]=x.v; });
+          this.answers=this.qs().map((q,i)=>{ const k=(q._orig_index!=null?q._orig_index:i); return (map[k]!=null?map[k]:null); });
+          const pos=this.qs().findIndex((q,i)=>((q._orig_index!=null?q._orig_index:i)===draft.io));
+          this.idx=pos>=0?pos:0;
+          this.clientRef=draft.ref||this.clientRef; if(draft.s) this.startTs=draft.s;
+          this.deadline=Math.min(draft.d,this.deadline); // never extend the clock
+        } else { try{ localStorage.removeItem('cbt-draft-'+this.data.code); }catch(__){} }
+      }
+    }catch(_){ }
     if(data.instructions){ if(!confirm('Instructions:\n\n'+data.instructions+'\n\nClick OK to begin.')) { this.codeEntry(code); return; } }
     this.beginMonitor(); this.tick(); this.render();
   },
@@ -165,7 +216,7 @@ const Exam = {
     let viol=0; const cfg=this.data.anti_cheat_config||{};
     this.monitor=CBT.startAntiCheat(cfg,(type,n)=>{ viol=n; this.violations=n; this.violationLog=this.monitor.log; const w=document.getElementById('viol'); if(w) w.textContent='⚠ '+n+' integrity flag(s)'; if((cfg.max_violations||5) && n>=cfg.max_violations){ toast('Too many integrity violations — submitting.','danger'); this.submit(); } });
   },
-  tick(){ if(this.timer) clearInterval(this.timer); const update=()=>{ this.remaining=Math.max(0, Math.ceil((this.deadline-Date.now())/1000)); const t=document.getElementById('clock'); if(t){ const m=Math.floor(this.remaining/60),ss=this.remaining%60; t.textContent=m+':'+String(ss).padStart(2,'0'); if(this.remaining<=60)t.style.color='#dc2626'; } if(this.remaining<=0){ clearInterval(this.timer); this.timer=null; toast('Time up — submitting.','warning'); this.submit(); } }; update(); this.timer=setInterval(update,1000); },
+  tick(){ if(this.timer) clearInterval(this.timer); const update=()=>{ this.remaining=Math.max(0, Math.ceil((this.deadline-this.now())/1000)); const t=document.getElementById('clock'); if(t){ const m=Math.floor(this.remaining/60),ss=this.remaining%60; t.textContent=m+':'+String(ss).padStart(2,'0'); if(this.remaining<=60)t.style.color='#dc2626'; } if(this.remaining<=0){ clearInterval(this.timer); this.timer=null; toast('Time up — submitting.','warning'); this.submit(); } }; update(); this.timer=setInterval(update,1000); },
   render(){
     const q=this.qs()[this.idx]; if(!q){ return; }
     const opts=(q.options||[]).map((o,i)=>{ const L=String.fromCharCode(65+i); const checked=this.answers[this.idx]===L?'checked':''; return '<label style="display:block;padding:10px;border:1px solid var(--gray-200);border-radius:8px;margin:6px 0;cursor:pointer"><input type="radio" name="opt" value="'+L+'" '+checked+' onchange="Exam.answer(\''+L+'\')"> '+L+'. '+esc(o)+'</label>'; }).join('');
@@ -183,7 +234,9 @@ const Exam = {
     '</div>';
   },
   answer(v){ this.answers[this.idx]=v; this.saveDraft(); },
-  saveDraft(){ try{ localStorage.setItem('cbt-draft-'+this.data.code, JSON.stringify({a:this.answers,i:this.idx})); }catch(e){} },
+  // Answers are keyed by _orig_index (not screen position) so a resume stays
+  // correct even when question shuffling produces a different order (V14).
+  saveDraft(){ try{ const arr=this.qs().map((q,i)=>({o:(q._orig_index!=null?q._orig_index:i),v:this.answers[i]})); const cur=this.qs()[this.idx]||{}; localStorage.setItem('cbt-draft-'+this.data.code, JSON.stringify({a:arr,io:(cur._orig_index!=null?cur._orig_index:this.idx),at:Date.now(),ref:this.clientRef,d:this.deadline||0,s:this.startTs||0})); }catch(e){} },
   flag(){ this.flags[this.idx]=!this.flags[this.idx]; this.render(); },
   go(i){ this.idx=i; this.render(); }, next(){ if(this.idx<this.qs().length-1){this.idx++;this.render();} }, prev(){ if(this.idx>0){this.idx--;this.render();} },
   confirmSubmit(){ const un=this.answers.filter(a=>a==null).length; if(un && !confirm(un+' question(s) unanswered. Submit anyway?'))return; this.submit(); },
@@ -192,6 +245,7 @@ const Exam = {
     const graded=CBT.gradeSubmission(this.data,this.answers);
     const timeTaken=Math.round((Date.now()-this.startTs)/1000);
     const payload={ exam_id:this.data.id, student_name:this.student.name, student_class:this.student.class, student_id_ref:this.student.id_ref, student_type:this.data.exam_mode,
+      client_ref:this.clientRef||null,
       score:graded.score, total:graded.total, percent:graded.percent, correct_count:graded.correct, wrong_count:graded.wrong, skipped_count:graded.skipped,
       time_taken:timeTaken, violations:this.violations||0, violation_log:this.violationLog||[],
       answers_data:this.qs().map((q,i)=>({ index:(q._orig_index!=null?q._orig_index:i), subject:(q.section||q.subject||'General'), answer:this.answers[i] })) };
@@ -203,14 +257,29 @@ const Exam = {
     // 6 retries, exponential backoff capped at 8s with jitter, plus an
     // auto-resubmit queue (pending submissions retry on next page load).
     let resp=null;
+    // ENTERPRISE V14: tiny submit jitter — when the timer ends for a whole
+    // hall at once, 1000 submissions spread across ~1.2 s instead of one
+    // same-second spike. cbt_submit_v2 is tried first (idempotent client_ref,
+    // attempt limits, closed-window guard); v1 schemas fall back seamlessly.
+    await new Promise(r=>setTimeout(r, Math.floor(Math.random()*1200)));
     for(let attempt=0;attempt<6;attempt++){
-      try{ resp=await sb.rpc('cbt_submit',{ p_payload: payload }); }catch(e){ resp={error:e}; }
+      resp=await this._submitRpc(payload);
       if(resp && !resp.error && resp.data && resp.data.saved) break;
+      // Definitive server refusals (attempt limit / exam closed) must NOT be retried.
+      const srv=resp && resp.data && (resp.data.error||'');
+      if(srv==='attempts_exhausted' || srv==='closed') break;
       const wait=Math.min(8000,(500*Math.pow(2,attempt)))+Math.floor(Math.random()*600);
       this.root().insertAdjacentHTML('beforeend','<p style="text-align:center;color:var(--gray-500)">Submitting… retry '+(attempt+1)+' of 6</p>');
       await new Promise(r=>setTimeout(r,wait));
     }
     if(!resp || resp.error || !resp.data || !resp.data.saved){
+      const serverMsg = resp && resp.data && (resp.data.message || resp.data.error);
+      if(serverMsg && /attempt|closed/i.test(String(serverMsg))){
+        // Clean server-side refusal: show it, keep no queue, no backup confusion.
+        try{ localStorage.removeItem('cbt-draft-'+this.data.code); }catch(e){}
+        this.root().innerHTML='<div class="card" style="text-align:center"><h3>⚠️ '+esc(serverMsg)+'</h3><p>If you believe this is a mistake, please contact your invigilator.</p></div>';
+        return;
+      }
       try{ const q=JSON.parse(localStorage.getItem('cbt-pending-queue')||'[]'); q.push(payload); localStorage.setItem('cbt-pending-queue',JSON.stringify(q.slice(-10))); }catch(_){}
     } else {
       try{ localStorage.removeItem('cbt-pending-queue'); }catch(_){}
@@ -289,12 +358,19 @@ function openModal(){} function closeModal(){}
 })();
 
 // ENTERPRISE V8: flush any queued (failed) submissions from a previous session.
+// ENTERPRISE V14: flushes go through the v2 idempotent endpoint first (a queued
+// payload carries its original client_ref, so a flush after a successful first
+// delivery returns the same result instead of duplicating); v1 fallback kept.
+async function cbtSubmitAny(p){
+  try{ const r=await sb.rpc('cbt_submit_v2',{p_payload:p}); if(r.error && Exam._missingFn(r.error)) return await sb.rpc('cbt_submit',{p_payload:p}); return r; }
+  catch(e){ try{ return await sb.rpc('cbt_submit',{p_payload:p}); }catch(e2){ return {error:e2}; } }
+}
 (async function(){
   try{
     const q=JSON.parse(localStorage.getItem('cbt-pending-queue')||'[]');
     if(q.length && window.sb){
       const rest=[];
-      for(const p of q){ try{ const r=await sb.rpc('cbt_submit',{p_payload:p}); if(!(r&&r.data&&r.data.saved)) rest.push(p); }catch(_){ rest.push(p); } }
+      for(const p of q){ try{ const r=await cbtSubmitAny(p); if(!(r&&r.data&&r.data.saved)) rest.push(p); }catch(_){ rest.push(p); } }
       localStorage.setItem('cbt-pending-queue',JSON.stringify(rest));
       if(q.length!==rest.length) toast((q.length-rest.length)+' queued submission(s) delivered.','success');
     }
